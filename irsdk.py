@@ -524,6 +524,9 @@ class IRSDK:
 
     @property
     def _var_buffer_latest(self):
+        # return the frozen var buffer if exists
+        if self.__var_buffer_latest:
+            return self.__var_buffer_latest
         # return 2nd most recent var buffer
         # because it might be a situation (with most recent var buffer)
         # that half of var buffer written with new data
