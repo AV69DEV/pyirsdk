@@ -15,7 +15,7 @@ try:
 except ImportError:
     from yaml import SafeLoader as YamlSafeLoader
 
-VERSION = '1.3.5'
+VERSION = '1.3.6'
 
 SIM_STATUS_URL = 'http://127.0.0.1:32034/get_sim_status?object=simStatus'
 
@@ -27,19 +27,20 @@ BROADCASTMSGNAME = 'IRSDK_BROADCASTMSG'
 VAR_TYPE_MAP = ['c', '?', 'i', 'I', 'f', 'd']
 
 YAML_TRANSLATER = bytes.maketrans(b'\x81\x8D\x8F\x90\x9D', b'     ')
-YAML_CODE_PAGE = 'cp1252'
 
 class StatusField:
     status_connected = 1
 
 class EngineWarnings:
-    water_temp_warning    = 0x01
-    fuel_pressure_warning = 0x02
-    oil_pressure_warning  = 0x04
-    engine_stalled        = 0x08
-    pit_speed_limiter     = 0x10
-    rev_limiter_active    = 0x20
-    oil_temp_warning      = 0x40
+    water_temp_warning    = 0x0001
+    fuel_pressure_warning = 0x0002
+    oil_pressure_warning  = 0x0004
+    engine_stalled        = 0x0008
+    pit_speed_limiter     = 0x0010
+    rev_limiter_active    = 0x0020
+    oil_temp_warning      = 0x0040
+    mand_rep_needed       = 0x0080 # car needs mandatory repairs
+    opt_rep_needed        = 0x0100 # car needs optional repairs
 
 class Flags:
     # global flags
@@ -61,11 +62,12 @@ class Flags:
     caution_waving   = 0x8000
 
     # drivers black flags
-    black      = 0x010000
-    disqualify = 0x020000
-    servicible = 0x040000 # car is allowed service (not a flag)
-    furled     = 0x080000
-    repair     = 0x100000
+    black              = 0x010000
+    disqualify         = 0x020000
+    servicible         = 0x040000 # car is allowed service (not a flag)
+    furled             = 0x080000
+    repair             = 0x100000 # Meatball - car has a dangerous mechanical problem that needs repairing
+    dq_scoring_invalid = 0x200000 # Has this car been disqualified and their score card ripped up? ALSO SET .disqualify!
 
     # start lights
     start_hidden = 0x10000000
@@ -168,6 +170,7 @@ class PitCommandMode: # this only works when the driver is in the car
     clear_ws    =  9 # Uncheck Clean the winshield checkbox
     clear_fr    = 10 # Uncheck request a fast repair
     clear_fuel  = 11 # Uncheck add fuel
+    tc          = 12 # Change tire compound
 
 class TelemCommandMode: # You can call this any time, but telemtry only records when driver is in there car
     stop    = 0 # Turn telemetry recording off
@@ -250,12 +253,12 @@ class FFBCommandMode: # You can call this any time
     ffb_command_max_force = 0 # Set the maximum force when mapping steering torque force to direct input units (float in Nm)
 
 class VideoCaptureMode:
-    trigger_screen_shot   = 0 # save a screenshot to disk
-    start_video_capture   = 1 # start capturing video
-    end_video_capture     = 2 # stop capturing video
-    toggle_video_capture  = 3 # toggle video capture on/off
-    show_video_timer      = 4 # show video timer in upper left corner of display
-    hide_video_timer      = 5 # hide video timer
+    trigger_screen_shot  = 0 # save a screenshot to disk
+    start_video_capture  = 1 # start capturing video
+    end_video_capture    = 2 # stop capturing video
+    toggle_video_capture = 3 # toggle video capture on/off
+    show_video_timer     = 4 # show video timer in upper left corner of display
+    hide_video_timer     = 5 # hide video timer
 
 class TrackWetness:
     unknown          = 0
@@ -266,6 +269,31 @@ class TrackWetness:
     moderately_wet   = 5
     very_wet         = 6
     extremely_wet    = 7
+
+class IncidentFlags:
+    # first byte is incident report flag
+    # only one of these will be used
+    rep_no_report                    = 0x0000 # no penalty
+    rep_out_of_control               = 0x0001 # "Loss of Control (2x)"
+    rep_off_track                    = 0x0002 # "Off Track (1x)"
+    rep_off_track_ongoing            = 0x0003 # not currently sent
+    rep_contact_with_world           = 0x0004 # "Contact (0x)"
+    rep_collision_with_world         = 0x0005 # "Contact (2x)"
+    rep_collision_with_world_ongoing = 0x0006 # not currently sent
+    rep_contact_with_car             = 0x0007 # "Car Contact (0x)"
+    rep_collision_with_car           = 0x0008 # "Car Contact (4x)"
+
+    # second byte is incident penalty
+    # only one of these will be used
+    pen_no_report                    = 0x0000 # no penalty
+    pen_zero_x                       = 0x0100 # 0x
+    pen_one_x                        = 0x0200 # 1x
+    pen_two_x                        = 0x0300 # 2x
+    pen_four_x                       = 0x0400 # 4x
+
+    # not enums, used to seperate the above incident report field from the incident penalty field
+    rep_mask                         = 0x00FF,
+    pen_mask                         = 0xFF00,
 
 
 class IRSDKStruct:
@@ -295,18 +323,20 @@ class IRSDKStruct:
 
 class Header(IRSDKStruct):
     version = IRSDKStruct.property_value(0, 'i')
-    status = IRSDKStruct.property_value(4, 'i')
-    tick_rate = IRSDKStruct.property_value(8, 'i')
+    status = IRSDKStruct.property_value(4, 'i')    # bitfield using StatusField
+    tick_rate = IRSDKStruct.property_value(8, 'i') # ticks per second (60 or 360 etc)
 
-    session_info_update = IRSDKStruct.property_value(12, 'i')
-    session_info_len = IRSDKStruct.property_value(16, 'i')
-    session_info_offset = IRSDKStruct.property_value(20, 'i')
+    session_info_update = IRSDKStruct.property_value(12, 'i') # incremented when session info changes
+    session_info_len = IRSDKStruct.property_value(16, 'i')    # length in bytes of session info string
+    session_info_offset = IRSDKStruct.property_value(20, 'i') # session info, encoded in YAML format
 
-    num_vars = IRSDKStruct.property_value(24, 'i')
-    var_header_offset = IRSDKStruct.property_value(28, 'i')
+    num_vars = IRSDKStruct.property_value(24, 'i')          # length of array pointed to by var_header_offset
+    var_header_offset = IRSDKStruct.property_value(28, 'i') # offset to Header.num_vars array, describes the variables received in VarBuffer
 
-    num_buf = IRSDKStruct.property_value(32, 'i')
-    buf_len = IRSDKStruct.property_value(36, 'i')
+    num_buf = IRSDKStruct.property_value(32, 'i')            # <= IRSDK_MAX_BUFS (3 for now)
+    buf_len = IRSDKStruct.property_value(36, 'i')            # length in bytes for one line
+    cur_buf_tick_count = IRSDKStruct.property_value(40, 'i') # stashed copy of the current tick_count, can read this to see if new data is available
+    cur_buf = IRSDKStruct.property_value(44, 'B')            # index of the most recently written buffer (0 to IRSDK_MAX_BUFS-1)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -317,8 +347,9 @@ class Header(IRSDKStruct):
         ]
 
 class VarBuffer(IRSDKStruct):
-    tick_count = IRSDKStruct.property_value(0, 'i')
-    _buf_offset = IRSDKStruct.property_value(4, 'i')
+    tick_count = IRSDKStruct.property_value(0, 'i')       # used to detect changes in data (updated AFTER write completes)
+    _buf_offset = IRSDKStruct.property_value(4, 'i')      # offset from header
+    tick_count_begin = IRSDKStruct.property_value(8, 'i') # updated BEFORE write starts (for torn read detection)
 
     def __init__(self, *args, buf_len, **kwargs):
         super().__init__(*args, **kwargs)
@@ -372,6 +403,7 @@ class IRSDK:
         self.__var_headers_names = None
         self.__var_buffer_latest = None
         self.__session_info_dict = {}
+        self.__is_session_info_utf8 = None
         self.__broadcast_msg_id = None
         self.__test_file = None
         self.__workaround_connected_state = 0
@@ -451,6 +483,7 @@ class IRSDK:
         self.__var_headers_names = None
         self.__var_buffer_latest = None
         self.__session_info_dict = {}
+        self.__is_session_info_utf8 = None
         self.__broadcast_msg_id = None
         if self.__test_file:
             self.__test_file.close()
@@ -460,7 +493,7 @@ class IRSDK:
         if not self.is_initialized:
             return
         f = open(to_file, 'w', encoding='utf-8')
-        f.write(self._shared_mem[self._header.session_info_offset:self._header.session_info_len].rstrip(b'\x00').decode(YAML_CODE_PAGE))
+        f.write(self._shared_mem[self._header.session_info_offset : self._header.session_info_offset + self._header.session_info_len].rstrip(b'\x00').decode('utf-8' if self.is_session_info_utf8 else 'cp1252'))
         f.write('\n'.join([
             '{:32}{}'.format(i, self[i])
             for i in sorted(self._var_headers_dict.keys(), key=str.lower)
@@ -527,11 +560,12 @@ class IRSDK:
         # return the frozen var buffer if exists
         if self.__var_buffer_latest:
             return self.__var_buffer_latest
-        # return 2nd most recent var buffer
+        # otherwise return 2nd most recent var buffer
         # because it might be a situation (with most recent var buffer)
         # that half of var buffer written with new data
         # and other half still old
-        return sorted(self._header.var_buf, key=lambda v: v.tick_count, reverse=True)[1]
+        i = max(0, min(self._header.num_buf - 1, 1))
+        return sorted(self._header.var_buf, key=lambda v: v.tick_count, reverse=True)[i]
 
     @property
     def _var_headers(self):
@@ -602,7 +636,7 @@ class IRSDK:
         start = self._header.session_info_offset
         end = start + self._header.session_info_len
         # search section by key
-        match_start = re.compile(('\n%s:\n' % key).encode(YAML_CODE_PAGE)).search(self._shared_mem, start, end)
+        match_start = re.compile(('\n%s:\n' % key).encode()).search(self._shared_mem, start, end)
         if not match_start:
             return None
         match_end = re.compile(b'\n\n').search(self._shared_mem, match_start.start() + 1, end)
@@ -627,13 +661,29 @@ class IRSDK:
             return session_data['data']
         session_data['data_binary'] = data_binary
 
+        is_utf8 = self.is_session_info_utf8
+
         # parsing
-        yaml_src = re.sub(YamlReader.NON_PRINTABLE, '', data_binary.translate(YAML_TRANSLATER).rstrip(b'\x00').decode(YAML_CODE_PAGE))
+        yaml_src = re.sub(YamlReader.NON_PRINTABLE, '', data_binary.translate(None if is_utf8 else YAML_TRANSLATER).rstrip(b'\x00').decode('utf-8' if is_utf8 else 'cp1252'))
+
+        # replacing `key: value` -> `key: "value"`
+        # double quotes and backslashes in value are escaped with backslash
+        def escape_double_quoted_string(m):
+            return m.group('key') + '"%s"' % re.sub(r'(["\\])', r'\\\1', m.group('value'))
+
+        if is_utf8:
+            # check all double quoted values and escape them
+            yaml_src = re.sub(r'(?P<key>^\s*\w+: )"(?P<value>.*)"$', escape_double_quoted_string, yaml_src, flags=re.M)
+
         if key == 'DriverInfo':
-            def name_replace(m):
-                return m.group(1) + '"%s"' % re.sub(r'(["\\])', r'\\\1', m.group(2))
-            yaml_src = re.sub(r'((?:DriverSetupName|UserName|TeamName|AbbrevName|Initials): )(.*)', name_replace, yaml_src)
-        yaml_src = re.sub(r'(\w+: )(,.*)', r'\1"\2"', yaml_src)
+            if is_utf8:
+                yaml_src = re.sub(r'(?P<key>(?:DriverSetupName): )(?P<value>.+)', escape_double_quoted_string, yaml_src)
+            else:
+                yaml_src = re.sub(r'(?P<key>(?:DriverSetupName|UserName|TeamName|AbbrevName|Initials): )(?P<value>.+)', escape_double_quoted_string, yaml_src)
+
+        # values that starts with a comma are being double quoted and escaped
+        yaml_src = re.sub(r'(?P<key>\w+: )(?P<value>,.*)', escape_double_quoted_string, yaml_src)
+
         result = yaml.load(yaml_src, Loader=CustomYamlSafeLoader)
         # check if result is available, and yaml data is not updated while we were parsing it in async mode
         if result and (not self.parse_yaml_async or self.last_session_info_update == session_info_update):
@@ -664,6 +714,14 @@ class IRSDK:
             num_place = 3 if num > 99 else 2 if num > 9 else 1
             return num + 1000 * (num_place + zero)
         return num
+
+    @property
+    def is_session_info_utf8(self):
+        if self.is_initialized and self.__is_session_info_utf8 is None:
+            utf8_sign = b'---\nWeekendInfo:\n Encoding: UTF8'
+            self.__is_session_info_utf8 = self._shared_mem[self._header.session_info_offset : self._header.session_info_offset + len(utf8_sign)] == utf8_sign
+        return self.__is_session_info_utf8
+
 
 class IBT:
     def __init__(self):

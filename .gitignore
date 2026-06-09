@@ -6,7 +6,7 @@ MANIFEST
 *.pyc
 *.bin
 *.txt
-test_*.py
+test*.py
 *.ibt
 tutorial_*.py
 setup.cfg
