@@ -598,13 +598,22 @@ class IRSDK:
         self.last_session_info_update = 0
 
         if self._shared_mem:
-            self._shared_mem.close()
-            self._shared_mem = None
+            try: 
+                self._shared_mem.close()
+            except Exception as e:
+                print(f"Error closing shared memory: {e}")
+            finally: 
+                self._shared_mem = None
         self._header = None
 
-        if self._data_valid_event:
-            self.win_api.close_handle(self._data_valid_event)
-            self._data_valid_event = None
+        if self._data_valid_event is not None:
+            try:
+                if not self.win_api.close_handle(self._data_valid_event):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            except Exception as e:
+                print(f"Error closing event handle: {e}")
+            finally:
+                self._data_valid_event = None
 
         self._data_valid_event = None
         self.__var_headers = None
@@ -614,6 +623,7 @@ class IRSDK:
         self.__session_info_dict = {}
         self.__is_session_info_utf8 = None
         self.__broadcast_msg_id = None
+        self.__workaround_connected_state = 0
         if self.__test_file:
             self.__test_file.close()
             self.__test_file = None
