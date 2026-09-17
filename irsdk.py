@@ -1,10 +1,14 @@
 #!python3
-
+from ctypes import wintypes
+from http import HTTPStatus
+import http.client
 import re
 import argparse
 import mmap
 import struct
 import ctypes
+from typing import Any
+from urllib.parse import urlparse
 import yaml
 from threading import Thread
 from urllib import request, error
@@ -295,6 +299,110 @@ class IncidentFlags:
     rep_mask                         = 0x00FF,
     pen_mask                         = 0xFF00,
 
+class winApiInterface:
+    def __init__(self, timeout: float = 1.0) -> None:
+        self.sim_status_url = SIM_STATUS_URL
+        self.timeout = timeout
+        self.WAIT_FOR_SINGLE_OBJECT_RESULTS: dict[str, int]
+        self.SYNCHRONIZE_VALUE: int
+        self.DATA_VALID_EVENT_NAME: str
+        self.open_event_w : Any
+        self.wait_for_single_object: Any
+        self.close_handle: Any
+        self.kernel32: Any
+        self.setup()
+
+    def is_sim_running(self) -> bool:
+        url = urlparse(self.sim_status_url)
+
+        if url.scheme != "http" or url.hostname is None:
+            raise ValueError(f"Invalid iRacing sim-status URL: {self.sim_status_url}")
+
+        target = url.path or "/"
+
+        if url.query:
+            target += f"?{url.query}"
+
+        connection = http.client.HTTPConnection(url.hostname, url.port, self.timeout)
+
+        try:
+            connection.request("GET", target)
+            response = connection.getresponse()
+
+            if response.status != HTTPStatus.OK:
+                return False
+
+            body = response.read().decode("utf-8")
+            return "running:1" in body
+        except (OSError, http.client.HTTPException):
+            return False
+        finally:
+            connection.close()
+
+    def get_data_valid_event_handle(self):
+        handle = self.open_event_w(
+                    self.SYNCHRONIZE_VALUE,
+                    False,
+                    self.DATA_VALID_EVENT_NAME,
+                )
+        if handle is None:
+            error_code = ctypes.get_last_error() # pyright: ignore[reportAttributeAccessIssue]
+
+            if error_code == 2:  # ERROR_FILE_NOT_FOUND
+                return None
+            
+            raise ctypes.WinError(error_code) # pyright: ignore[reportAttributeAccessIssue]
+        return handle
+
+    def get_data_valid_event_status(self, handle: int, timeout_ms: int = 32,):
+        result = self.wait_for_single_object(handle, timeout_ms)
+
+        if result == self.WAIT_FOR_SINGLE_OBJECT_RESULTS["WAIT_OBJECT_0"]:
+            return True
+
+        if result == self.WAIT_FOR_SINGLE_OBJECT_RESULTS["WAIT_TIMEOUT"]:
+            return False
+
+        if result == self.WAIT_FOR_SINGLE_OBJECT_RESULTS["WAIT_FAILED"]:
+            raise ctypes.WinError(ctypes.get_last_error()) # pyright: ignore[reportAttributeAccessIssue]
+
+        raise RuntimeError(
+            f"Unexpected WaitForSingleObject result: {result}"
+        )
+        
+
+        
+        
+    def setup(self):
+        self.WAIT_FOR_SINGLE_OBJECT_RESULTS: dict[str, int] = {
+                    "WAIT_OBJECT_0": 0x00000000,
+                    "WAIT_TIMEOUT": 0x00000102,
+                    "WAIT_FAILED": 0xFFFFFFFF
+                }
+        self.SYNCHRONIZE_VALUE = 0x00100000
+        self.DATA_VALID_EVENT_NAME = 'Local\\IRSDKDataValidEvent'
+
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) # pyright: ignore[reportAttributeAccessIssue]
+
+        self.open_event_w = self.kernel32.OpenEventW
+        self.open_event_w.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        )
+        self.open_event_w.restype = wintypes.HANDLE
+
+        self.wait_for_single_object = self.kernel32.WaitForSingleObject
+        self.wait_for_single_object.argtypes = (
+            wintypes.HANDLE,
+            wintypes.DWORD,
+        )
+        self.wait_for_single_object.restype = wintypes.DWORD
+
+        self.close_handle = self.kernel32.CloseHandle
+        self.close_handle.argtypes = (wintypes.HANDLE,)
+        self.close_handle.restype = wintypes.BOOL
+
 
 class IRSDKStruct:
     @classmethod
@@ -390,6 +498,7 @@ class DiskSubHeader(IRSDKStruct):
 
 class IRSDK:
     def __init__(self, parse_yaml_async=False):
+        self.win_api = winApiInterface()
         self.parse_yaml_async = parse_yaml_async
         self.is_initialized = False
         self.last_session_info_update = 0
@@ -446,37 +555,57 @@ class IRSDK:
         return self.__var_headers_names
 
     def startup(self, test_file=None, dump_to=None):
-        if test_file is None:
-            if not self._check_sim_status():
-                return False
-            self._data_valid_event = ctypes.windll.kernel32.OpenEventW(0x00100000, False, DATAVALIDEVENTNAME)
-        if not self._wait_valid_data_event():
-            self._data_valid_event = None
-            return False
+        if self.is_initialized:
+            return True
+    
+        try:
+            if test_file is None:
+                if not self.win_api.is_sim_running():
+                    return False
 
-        if self._shared_mem is None:
-            if test_file:
-                self.__test_file = open(test_file, 'rb')
-                self._shared_mem = mmap.mmap(self.__test_file.fileno(), 0, access=mmap.ACCESS_READ)
-            else:
-                self._shared_mem = mmap.mmap(0, MEMMAPFILESIZE, MEMMAPFILE, access=mmap.ACCESS_READ)
+                self._data_valid_event = self.win_api.get_data_valid_event_handle()
 
-        if self._shared_mem:
-            if dump_to:
-                with open(dump_to, 'wb') as f:
-                    f.write(self._shared_mem)
-            self._header = Header(self._shared_mem)
-            self.is_initialized = self._header.version >= 1 and len(self._header.var_buf) > 0
+                if not self._data_valid_event:
+                    return False
 
-        return self.is_initialized
+                if not self.win_api.get_data_valid_event_status(
+                    self._data_valid_event
+                ):
+                    return False
+
+            if self._shared_mem is None:
+                if test_file:
+                    self.__test_file = open(test_file, 'rb')
+                    self._shared_mem = mmap.mmap(self.__test_file.fileno(), 0, access=mmap.ACCESS_READ)
+                else:
+                    self._shared_mem = mmap.mmap(0, MEMMAPFILESIZE, MEMMAPFILE, access=mmap.ACCESS_READ)
+
+            if self._shared_mem:
+                if dump_to:
+                    with open(dump_to, 'wb') as f:
+                        f.write(self._shared_mem)
+                self._header = Header(self._shared_mem)
+                self.is_initialized = self._header.version >= 1 and len(self._header.var_buf) > 0
+
+            return self.is_initialized
+        finally:
+            if not self.is_initialized:
+                self.shutdown()
+        
 
     def shutdown(self):
         self.is_initialized = False
         self.last_session_info_update = 0
+
         if self._shared_mem:
             self._shared_mem.close()
             self._shared_mem = None
         self._header = None
+
+        if self._data_valid_event:
+            self.win_api.close_handle(self._data_valid_event)
+            self._data_valid_event = None
+
         self._data_valid_event = None
         self.__var_headers = None
         self.__var_headers_dict = None
@@ -548,13 +677,6 @@ class IRSDK:
     def video_capture(self, video_capture_mode=VideoCaptureMode.trigger_screen_shot):
         return self._broadcast_msg(BroadcastMsg.video_capture, video_capture_mode)
 
-    def _check_sim_status(self):
-        try:
-            return 'running:1' in request.urlopen(SIM_STATUS_URL).read().decode('utf-8')
-        except error.URLError as e:
-            print("Failed to connect to sim: {}".format(e.reason))
-            return False
-
     @property
     def _var_buffer_latest(self):
         # return the frozen var buffer if exists
@@ -585,9 +707,24 @@ class IRSDK:
         return self.__var_headers_dict
 
     def freeze_var_buffer_latest(self):
+        if not self.is_initialized:
+            raise RuntimeError("IRSDK is not initialized")
+
         self.unfreeze_var_buffer_latest()
-        self._wait_valid_data_event()
-        self.__var_buffer_latest = sorted(self._header.var_buf, key=lambda v: v.tick_count, reverse=True)[0]
+
+        if self.__test_file is None:
+            if not self._data_valid_event:
+                raise RuntimeError("Data valid event is not open")
+
+            self.win_api.get_data_valid_event_status(
+                self._data_valid_event
+            )
+
+        self.__var_buffer_latest = sorted(
+            self._header.var_buf,
+            key=lambda v: v.tick_count,
+            reverse=True,
+        )[0]
         self.__var_buffer_latest.freeze()
 
     def unfreeze_var_buffer_latest(self):
@@ -599,12 +736,6 @@ class IRSDK:
         if key in self.__session_info_dict:
             return self.__session_info_dict[key]['update']
         return None
-
-    def _wait_valid_data_event(self):
-        if self._data_valid_event is not None:
-            return ctypes.windll.kernel32.WaitForSingleObject(self._data_valid_event, 32) == 0 if self._data_valid_event else False
-        else:
-            return True
 
     def _get_session_info(self, key):
         if self.last_session_info_update < self._header.session_info_update:
