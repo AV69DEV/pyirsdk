@@ -1,7 +1,22 @@
 #!python3
+import ast
+from pathlib import Path
 
 from setuptools import setup
-from irsdk import VERSION
+
+
+source = Path(__file__).with_name("irsdk.py").read_text(encoding="utf-8")
+module = ast.parse(source)
+
+for node in module.body:
+    if isinstance(node, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "VERSION"
+        for target in node.targets
+    ):
+        VERSION = ast.literal_eval(node.value)
+        break
+else:
+    raise RuntimeError("VERSION is not defined in irsdk.py")
 
 setup(
     name='pyirsdk',
